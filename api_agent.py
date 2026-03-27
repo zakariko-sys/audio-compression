@@ -262,15 +262,24 @@ def orchestrer():
     Exécute le pipeline complet en une seule requête:
     analyse -> décision -> compression -> évaluation
 
-    Body:
-    {
-      "chemin_fichier": "d:/Agent_dec/test_tone.wav",
-      "output_path": "d:/Agent_dec/sortie.opus"  # optionnel
-    }
+    Accepte soit:
+    - multipart/form-data avec champ "fichier" (upload direct depuis n8n)
+    - JSON avec "file_url" (URL publique)
+    - JSON avec "chemin_fichier" (chemin local sur le serveur)
     """
     try:
-        donnees = request.get_json() or {}
-        chemin_fichier, est_temporaire = _resoudre_fichier_input(donnees)
+        if request.files.get("fichier"):
+            f = request.files["fichier"]
+            ext = os.path.splitext(f.filename)[1] if f.filename else ".audio"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+            f.save(tmp.name)
+            tmp.close()
+            chemin_fichier = tmp.name
+            est_temporaire = True
+            donnees = request.form.to_dict()
+        else:
+            donnees = request.get_json() or {}
+            chemin_fichier, est_temporaire = _resoudre_fichier_input(donnees)
 
         # 1) Analyse
         agent_analyse = AgentAnalyse()
