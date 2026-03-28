@@ -1,7 +1,9 @@
 import os
+import glob
 import tempfile
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime
 
 from flask import Flask, request, jsonify
@@ -12,6 +14,57 @@ from agent_decision import decider_compression
 from agent_evaluateur import EvaluatorAgent
 
 app = Flask(__name__)
+
+STORAGE_DIR = os.path.join(tempfile.gettempdir(), "audio_api_store")
+
+
+def _get_storage_dir():
+    os.makedirs(STORAGE_DIR, exist_ok=True)
+    return STORAGE_DIR
+
+
+def _nouveau_file_id():
+    return uuid.uuid4().hex
+
+
+def _extension_pour_codec(codec):
+    extensions = {
+        "mp3": ".mp3",
+        "aac": ".aac",
+        "opus": ".opus",
+        "ogg": ".ogg",
+        "ogg_vorbis": ".ogg",
+        "flac": ".flac",
+    }
+    return extensions.get(codec, f".{codec}")
+
+
+def _resoudre_path_par_file_id(file_id):
+    if not file_id:
+        raise ValueError("file_id est requis")
+
+    file_id = str(file_id).strip()
+    if not file_id:
+        raise ValueError("file_id invalide")
+
+    pattern = os.path.join(_get_storage_dir(), f"{file_id}.*")
+    matches = glob.glob(pattern)
+    if not matches:
+        raise ValueError(f"Aucun fichier trouve pour file_id={file_id}")
+
+    return matches[0]
+
+
+def _sauvegarder_upload(uploaded_file):
+    if uploaded_file is None:
+        raise ValueError("Le champ fichier est requis")
+
+    original_name = uploaded_file.filename or "audio"
+    extension = os.path.splitext(original_name)[1] or ".audio"
+    file_id = _nouveau_file_id()
+    output_path = os.path.join(_get_storage_dir(), f"{file_id}{extension}")
+    uploaded_file.save(output_path)
+    return file_id, output_path
 
 
 def _extraire_analyse(donnees):
@@ -28,15 +81,7 @@ def _extraire_decision(donnees):
 
 def _construire_sortie_par_defaut(audio_path, codec):
     base, _ = os.path.splitext(audio_path)
-    extensions = {
-        "mp3": ".mp3",
-        "aac": ".aac",
-        "opus": ".opus",
-        "ogg": ".ogg",
-        "ogg_vorbis": ".ogg",
-        "flac": ".flac",
-    }
-    extension = extensions.get(codec, f".{codec}")
+    extension = _extension_pour_codec(codec)
     return f"{base}_compresse{extension}"
 
 
@@ -48,6 +93,10 @@ def _resoudre_fichier_input(donnees):
 
     Retourne (chemin_local, est_temporaire)
     """
+    file_id = donnees.get("file_id")
+    if file_id:
+        return _resoudre_path_par_file_id(file_id), False
+
     chemin_fichier = donnees.get("chemin_fichier")
     if chemin_fichier:
         return chemin_fichier, False
@@ -115,6 +164,32 @@ def _construire_resultat_consolide(*, audio_path, analyse_raw, decision_raw, com
         }
     }
 
+
+@app.route("/api/upload", methods=["POST"])
+def upload_audio():
+    """
+    Upload un fichier audio une seule fois et retourne un file_id.
+
+    Form-data:
+    - fichier: binaire du fichier audio
+    """
+    try:
+        if "fichier" not in request.files:
+            return jsonify({"success": False, "error": "Le champ fichier est requis"}), 400
+
+        file_id, output_path = _sauvegarder_upload(request.files["fichier"])
+        size_bytes = os.path.getsize(output_path)
+        return jsonify(
+            {
+                "success": True,
+                "file_id": file_id,
+                "stored_path": output_path,
+                "size_bytes": size_bytes,
+            }
+        )
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
 @app.route("/api/analyser", methods=["POST"])
 def analyser():
     """
@@ -128,13 +203,17 @@ def analyser():
     try:
         donnees = request.get_json() or {}
         chemin_fichier, est_temporaire = _resoudre_fichier_input(donnees)
+        file_id = donnees.get("file_id")
         
         agent = AgentAnalyse()
         resultat = agent.analyser(chemin_fichier)
+        analyse_dict = resultat.vers_dictionnaire()
+        if file_id:
+            analyse_dict["file_id"] = file_id
         
         return jsonify({
             "success": True,
-            "analyse": resultat.vers_dictionnaire()
+            "analyse": analyse_dict
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 400
@@ -196,13 +275,27 @@ def compresser():
         analyse = _extraire_analyse(donnees)
         decision = _extraire_decision(donnees)
 
+        file_id = donnees.get("file_id") or analyse.get("file_id")
         audio_path = donnees.get("audio_path") or analyse.get("chemin_fichier")
+        if not audio_path and file_id:
+            audio_path = _resoudre_path_par_file_id(file_id)
+
         codec = donnees.get("codec") or decision.get("codec")
         bitrate = donnees.get("bitrate") or decision.get("debit_kbps")
         output_path = donnees.get("output_path")
+        output_file_id = donnees.get("output_file_id")
+
+        if not output_path and codec:
+            if not output_file_id:
+                output_file_id = _nouveau_file_id()
+            output_path = os.path.join(_get_storage_dir(), f"{output_file_id}{_extension_pour_codec(codec)}")
 
         if not output_path and audio_path and codec:
             output_path = _construire_sortie_par_defaut(audio_path, codec)
+
+        if not output_file_id and output_path:
+            basename = os.path.basename(output_path)
+            output_file_id = os.path.splitext(basename)[0]
 
         if not audio_path or not output_path or not codec:
             return jsonify({
@@ -217,6 +310,7 @@ def compresser():
             codec=codec,
             bitrate=bitrate,
         )
+        resultat["output_file_id"] = output_file_id
         return jsonify({"success": True, "compression": resultat})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 400
@@ -238,8 +332,16 @@ def evaluer():
         analyse = _extraire_analyse(donnees)
         compression = donnees.get("compression") if isinstance(donnees.get("compression"), dict) else {}
 
+        original_file_id = donnees.get("original_file_id") or donnees.get("file_id") or analyse.get("file_id")
+        compressed_file_id = donnees.get("compressed_file_id") or compression.get("output_file_id")
+
         original_path = donnees.get("original_path") or analyse.get("chemin_fichier")
+        if not original_path and original_file_id:
+            original_path = _resoudre_path_par_file_id(original_file_id)
+
         compressed_path = donnees.get("compressed_path") or compression.get("fichier_compressé")
+        if not compressed_path and compressed_file_id:
+            compressed_path = _resoudre_path_par_file_id(compressed_file_id)
 
         if not original_path or not compressed_path:
             return jsonify({
