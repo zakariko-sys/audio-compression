@@ -2,6 +2,7 @@
 # Agent Compresseur
 
 import os
+import shutil
 
 from compression_utils import compress_aac, compress_flac, compress_mp3, compress_ogg, compress_opus
 
@@ -52,8 +53,24 @@ class CompressorAgent:
             raise ValueError(f"Format non supporte: {codec}")
         
         taille_compressée = os.path.getsize(output_path)
-        taux = (1 - taille_compressée / taille_originale) * 100
-        
+
+        # Fallback: si le fichier compressé est plus grand que l'original,
+        # on abandonne la compression et on garde l'original tel quel.
+        if taille_compressée >= taille_originale:
+            os.remove(output_path)
+            _, ext_originale = os.path.splitext(audio_path)
+            output_path_fallback = os.path.splitext(output_path)[0] + ext_originale
+            shutil.copy2(audio_path, output_path_fallback)
+            output_path = output_path_fallback
+            taille_compressée = taille_originale
+            taux = 0.0
+            codec_normalise = "original (aucune compression)"
+            bitrate = "N/A"
+            print(f"[CompressorAgent] Fichier deja optimal, original conserve.")
+        else:
+            taux = (1 - taille_compressée / taille_originale) * 100
+            print(f"[CompressorAgent] Compression terminee: {round(taux, 2)}%")
+
         resultat = {
             "taux_compression": round(taux, 2),
             "taille_originale_ko": round(taille_originale / 1024, 2),
@@ -63,6 +80,5 @@ class CompressorAgent:
             "fichier_original": audio_path,
             "fichier_compressé": output_path
         }
-        
-        print(f"[CompressorAgent] Compression terminee: {round(taux, 2)}%")
+
         return resultat
