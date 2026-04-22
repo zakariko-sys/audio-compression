@@ -49,7 +49,7 @@ Ces dependances sont installees automatiquement via [requirements.txt](requireme
 ### Etape 2: Envoyer un fichier audio
 1. Ouvrir le noeud **Audio File Input Form**
 2. Ouvrir l'URL du formulaire
-3. Selectionner un fichier audio depuis le PC (tous formats supportes: MP3, WAV, MP4, AAC, FLAC, Opus, OGG, M4A, etc.)
+3. Selectionner un fichier audio depuis le PC (WAV, MP3, AAC, FLAC, Opus, OGG)
 4. Cliquer sur **Submit**
 
 ### Etape 3: Traitement automatique

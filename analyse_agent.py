@@ -4,14 +4,12 @@ import argparse
 import json
 import math
 import os
-import tempfile
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict
 
 import librosa
 import numpy as np
 import soundfile as sf
-from pydub import AudioSegment
 
 
 @dataclass(frozen=True)
@@ -47,122 +45,96 @@ class AgentAnalyse:
 
         _, ext = os.path.splitext(chemin_fichier)
         ext = ext.lower()
-        
-        # Formats directement supportés par soundfile (pas de conversion nécessaire)
-        FORMATS_DIRECTS = {".wav", ".flac", ".ogg", ".opus", ".aiff", ".aif", ".mp3"}
-        
-        fichier_a_analyser = chemin_fichier
-        fichier_temporaire = None
-        
+        _FORMATS_SUPPORTES = {".wav", ".flac", ".ogg", ".opus", ".aiff", ".aif", ".mp3"}
+        if ext not in _FORMATS_SUPPORTES:
+            raise ValueError(
+                f"Format de fichier non supporte : {ext}. "
+                f"Formats acceptes : {', '.join(_FORMATS_SUPPORTES)}"
+            )
+
+        info = sf.info(chemin_fichier)
+        signal, taux_echantillonnage = librosa.load(chemin_fichier, sr=None, mono=False)
+        signal = np.asarray(signal, dtype=np.float32)
+
+        if signal.ndim == 1:
+            canaux = 1
+            signal_mono = signal
+        else:
+            canaux = int(signal.shape[0])
+            signal_mono = np.mean(signal, axis=0)
+
+        duree_s = float(librosa.get_duration(y=signal_mono, sr=taux_echantillonnage))
+        taille_fichier_octets = os.path.getsize(chemin_fichier)
+        debit_source_kbps = self._estimer_debit_kbps(taille_fichier_octets, duree_s)
+
+        zcr = float(np.mean(librosa.feature.zero_crossing_rate(signal_mono)))
+        rms = float(np.mean(librosa.feature.rms(y=signal_mono)))
+
         try:
-            # Si le format n'est pas directement supporté, convertir avec pydub
-            if ext not in FORMATS_DIRECTS:
-                print(f"Conversion du format {ext} vers WAV temporaire...")
-                
-                # Charger le fichier avec pydub
-                audio = AudioSegment.from_file(chemin_fichier)
-                
-                # Créer un fichier temporaire WAV
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-                    fichier_temporaire = tmp.name
-                    audio.export(fichier_temporaire, format='wav')
-                
-                fichier_a_analyser = fichier_temporaire
-                print(f"Fichier converti: {fichier_temporaire}")
-            
-            # Analyser le fichier (original ou converti)
-            info = sf.info(fichier_a_analyser)
-            signal, taux_echantillonnage = librosa.load(fichier_a_analyser, sr=None, mono=False)
-            signal = np.asarray(signal, dtype=np.float32)
+            tempo = float(librosa.feature.rhythm.tempo(y=signal_mono, sr=taux_echantillonnage)[0])
+        except Exception:
+            tempo = 0.0
 
-            if signal.ndim == 1:
-                canaux = 1
-                signal_mono = signal
-            else:
-                canaux = int(signal.shape[0])
-                signal_mono = np.mean(signal, axis=0)
+        spectral_centroid = float(
+            np.mean(librosa.feature.spectral_centroid(y=signal_mono, sr=taux_echantillonnage))
+        )
+        spectral_bandwidth = float(
+            np.mean(librosa.feature.spectral_bandwidth(y=signal_mono, sr=taux_echantillonnage))
+        )
+        spectral_rolloff = float(
+            np.mean(librosa.feature.spectral_rolloff(y=signal_mono, sr=taux_echantillonnage))
+        )
 
-            duree_s = float(librosa.get_duration(y=signal_mono, sr=taux_echantillonnage))
-            taille_fichier_octets = os.path.getsize(chemin_fichier)
-            debit_source_kbps = self._estimer_debit_kbps(taille_fichier_octets, duree_s)
+        stft = np.abs(librosa.stft(signal_mono))
+        stft_normalise = stft / (np.sum(stft) + 1e-10)
+        entropie_spectrale = float(-np.sum(stft_normalise * np.log2(stft_normalise + 1e-10)))
 
-            zcr = float(np.mean(librosa.feature.zero_crossing_rate(signal_mono)))
-            rms = float(np.mean(librosa.feature.rms(y=signal_mono)))
+        probabilite_parole, probabilite_musique, etiquette_contenu = self._estimer_probabilites(
+            zcr=zcr,
+            rms=rms,
+            tempo=tempo,
+            spectral_centroid=spectral_centroid,
+            spectral_bandwidth=spectral_bandwidth,
+            entropie_spectrale=entropie_spectrale,
+        )
 
-            try:
-                tempo = float(librosa.feature.rhythm.tempo(y=signal_mono, sr=taux_echantillonnage)[0])
-            except Exception:
-                tempo = 0.0
+        crete = float(np.max(np.abs(signal_mono)))
+        crete_vrai_dbfs = self._amplitude_vers_dbfs(crete)
+        rms_dbfs = self._amplitude_vers_dbfs(rms)
+        facteur_crete_db = round(max(0.0, crete_vrai_dbfs - rms_dbfs), 2)
+        lufs_integre = round(rms_dbfs, 2)
 
-            spectral_centroid = float(
-                np.mean(librosa.feature.spectral_centroid(y=signal_mono, sr=taux_echantillonnage))
-            )
-            spectral_bandwidth = float(
-                np.mean(librosa.feature.spectral_bandwidth(y=signal_mono, sr=taux_echantillonnage))
-            )
-            spectral_rolloff = float(
-                np.mean(librosa.feature.spectral_rolloff(y=signal_mono, sr=taux_echantillonnage))
-            )
+        codec_source = self._normaliser_codec_source(info)
 
-            stft = np.abs(librosa.stft(signal_mono))
-            stft_normalise = stft / (np.sum(stft) + 1e-10)
-            entropie_spectrale = float(-np.sum(stft_normalise * np.log2(stft_normalise + 1e-10)))
+        extras = {
+            "chemin_fichier": chemin_fichier,
+            "nom_fichier": os.path.basename(chemin_fichier),
+            "taille_fichier_mb": round(taille_fichier_octets / 1_000_000, 3),
+            "tempo_bpm": round(tempo, 1),
+            "zero_crossing_rate": round(zcr, 5),
+            "rms_energie": round(rms, 5),
+            "spectral_centroid_hz": round(spectral_centroid, 1),
+            "spectral_bandwidth_hz": round(spectral_bandwidth, 1),
+            "spectral_rolloff_hz": round(spectral_rolloff, 1),
+            "entropie_spectrale": round(entropie_spectrale, 3),
+            "etiquette_contenu": etiquette_contenu,
+            "format_source": info.format,
+            "sous_type_source": info.subtype,
+        }
 
-            probabilite_parole, probabilite_musique, etiquette_contenu = self._estimer_probabilites(
-                zcr=zcr,
-                rms=rms,
-                tempo=tempo,
-                spectral_centroid=spectral_centroid,
-                spectral_bandwidth=spectral_bandwidth,
-                entropie_spectrale=entropie_spectrale,
-            )
-
-            crete = float(np.max(np.abs(signal_mono)))
-            crete_vrai_dbfs = self._amplitude_vers_dbfs(crete)
-            rms_dbfs = self._amplitude_vers_dbfs(rms)
-            facteur_crete_db = round(max(0.0, crete_vrai_dbfs - rms_dbfs), 2)
-            lufs_integre = round(rms_dbfs, 2)
-
-            codec_source = self._normaliser_codec_source(info)
-
-            extras = {
-                "chemin_fichier": chemin_fichier,
-                "nom_fichier": os.path.basename(chemin_fichier),
-                "taille_fichier_mb": round(taille_fichier_octets / 1_000_000, 3),
-                "tempo_bpm": round(tempo, 1),
-                "zero_crossing_rate": round(zcr, 5),
-                "rms_energie": round(rms, 5),
-                "spectral_centroid_hz": round(spectral_centroid, 1),
-                "spectral_bandwidth_hz": round(spectral_bandwidth, 1),
-                "spectral_rolloff_hz": round(spectral_rolloff, 1),
-                "entropie_spectrale": round(entropie_spectrale, 3),
-                "etiquette_contenu": etiquette_contenu,
-                "format_source": info.format,
-                "sous_type_source": info.subtype,
-            }
-
-            return ResultatAnalyse(
-                duree_s=round(duree_s, 2),
-                taux_echantillonnage_hz=int(taux_echantillonnage),
-                canaux=canaux,
-                probabilite_parole=probabilite_parole,
-                probabilite_musique=probabilite_musique,
-                lufs_integre=lufs_integre,
-                crete_vrai_dbfs=round(crete_vrai_dbfs, 2),
-                facteur_crete_db=facteur_crete_db,
-                codec_source=codec_source,
-                debit_source_kbps=debit_source_kbps,
-                extras=extras,
-            )
-        
-        finally:
-            # Nettoyer le fichier temporaire si il a été créé
-            if fichier_temporaire and os.path.exists(fichier_temporaire):
-                try:
-                    os.unlink(fichier_temporaire)
-                    print(f"Fichier temporaire nettoyé: {fichier_temporaire}")
-                except Exception as e:
-                    print(f"Erreur lors du nettoyage du fichier temporaire: {e}")
+        return ResultatAnalyse(
+            duree_s=round(duree_s, 2),
+            taux_echantillonnage_hz=int(taux_echantillonnage),
+            canaux=canaux,
+            probabilite_parole=probabilite_parole,
+            probabilite_musique=probabilite_musique,
+            lufs_integre=lufs_integre,
+            crete_vrai_dbfs=round(crete_vrai_dbfs, 2),
+            facteur_crete_db=facteur_crete_db,
+            codec_source=codec_source,
+            debit_source_kbps=debit_source_kbps,
+            extras=extras,
+        )
 
     @staticmethod
     def _estimer_debit_kbps(taille_fichier_octets: int, duree_s: float) -> int:
