@@ -43,6 +43,15 @@ class AgentAnalyse:
         if not os.path.exists(chemin_fichier):
             raise FileNotFoundError(f"Fichier introuvable : {chemin_fichier}")
 
+        _, ext = os.path.splitext(chemin_fichier)
+        ext = ext.lower()
+        _FORMATS_SUPPORTES = {".wav", ".flac", ".ogg", ".opus", ".aiff", ".aif", ".mp3"}
+        if ext not in _FORMATS_SUPPORTES:
+            raise ValueError(
+                f"Format de fichier non supporte : {ext}. "
+                f"Formats acceptes : {', '.join(_FORMATS_SUPPORTES)}"
+            )
+
         info = sf.info(chemin_fichier)
         signal, taux_echantillonnage = librosa.load(chemin_fichier, sr=None, mono=False)
         signal = np.asarray(signal, dtype=np.float32)
